@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import json
 import sqlite3
 import threading
@@ -275,23 +276,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode='Markdown'
     )
 
-# ==================== Message Handler ====================
+# ==================== Message Handlers ====================
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """دریافت پیام کاربر و ارسال به مالک"""
+    """دریافت پیام کاربر و ارسال به مالک - فقط برای غیر مالک"""
     if not update.message or not update.effective_user:
         return
+    
+    uid = update.effective_user.id
+    
+    # اگر مالک است، این هندلر کار نمی‌کند (به جز دکمه پنل مدیریت)
+    if is_owner(uid):
+        # اگر دکمه پنل مدیریت بود، آن را مدیریت کن
+        text = update.message.text or ""
+        if text == BTN_ADMIN:
+            if not await check_access(update, context):
+                return
+            await update.message.reply_text("🛠 **پنل مدیریت**", reply_markup=admin_kb(), parse_mode='Markdown')
+            return
+        return  # مالک پیام عادی ارسال کرده، کاری نکن
+    
     if not await check_access(update, context):
         return
 
-    uid = update.effective_user.id
     user = update.effective_user
     message_text = update.message.text or update.message.caption or ""
-
-    # اگر دکمه مدیریت بود، آن را مدیریت کن
-    if message_text == BTN_ADMIN and is_owner(uid):
-        await update.message.reply_text("🛠 **پنل مدیریت**", reply_markup=admin_kb(), parse_mode='Markdown')
-        return
 
     # ذخیره گزارش در دیتابیس
     username = user.username or "بدون یوزرنیم"
@@ -341,137 +350,18 @@ async def notify_owner(update: Update, context: ContextTypes.DEFAULT_TYPE, repor
     except Exception as e:
         logger.error(f"Failed to notify owner: {e}")
 
-# ==================== Admin Reply (پاسخ به گزارش) ====================
-
-async def admin_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """شروع پاسخ به گزارش (از طریق دکمه)"""
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return ConversationHandler.END
-    if not await check_access(update, context):
-        return ConversationHandler.END
-
-    report_id = int(query.data.split('_')[2])
-    context.user_data['reply_report_id'] = report_id
-    await query.edit_message_text(
-        f"📩 **پاسخ به گزارش #{report_id}**\n\n"
-        "لطفاً پاسخ خود را به صورت متن ارسال کنید:\n"
-        "(برای لغو /cancel بزنید)",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
-        ])
-    )
-    return 10  # S_ADMIN_REPLY_TEXT
-
-async def admin_reply_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """دریافت متن پاسخ و ارسال به کاربر"""
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return ConversationHandler.END
-    if not await check_access(update, context):
-        return ConversationHandler.END
-
-    reply_text = update.message.text
-    report_id = context.user_data.get('reply_report_id')
-    if not report_id:
-        await update.message.reply_text("❌ خطا: شناسه گزارش یافت نشد.")
-        return ConversationHandler.END
-
-    # دریافت اطلاعات کاربر
-    report = db_one("SELECT user_id FROM reports WHERE id = ?", (report_id,))
-    if not report:
-        await update.message.reply_text("❌ گزارش یافت نشد.")
-        return ConversationHandler.END
-
-    target_user_id = report['user_id']
-
-    # بروزرسانی دیتابیس
-    db_exec(
-        "UPDATE reports SET reply_text = ?, replied_at = ? WHERE id = ?",
-        (reply_text, now_tehran(), report_id)
-    )
-    log_action(uid, "owner_reply", f"report_id={report_id}, user={target_user_id}")
-
-    # ارسال پاسخ به کاربر
-    try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"📩 **پاسخ مالک ربات به گزارش شما**\n\n"
-                 f"{reply_text}\n\n"
-                 f"🕐 {now_tehran()}",
-            parse_mode='Markdown'
-        )
-        await update.message.reply_text(
-            f"✅ پاسخ شما به گزارش #{report_id} با موفقیت ارسال شد.",
-            reply_markup=main_menu_kb(uid)
-        )
-    except Exception as e:
-        logger.error(f"Error sending reply to user: {e}")
-        await update.message.reply_text(
-            f"⚠️ پاسخ در دیتابیس ثبت شد اما ارسال به کاربر با خطا مواجه شد.",
-            reply_markup=main_menu_kb(uid)
-        )
-
-    context.user_data.pop('reply_report_id', None)
-    return ConversationHandler.END
-
-# ==================== Admin Block (بلاک کاربر) ====================
-
-async def admin_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """بلاک کردن کاربر از طریق دکمه"""
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
-        return
-
-    report_id = int(query.data.split('_')[2])
-    report = db_one("SELECT user_id, username FROM reports WHERE id = ?", (report_id,))
-    if not report:
-        await query.edit_message_text("❌ گزارش یافت نشد.")
-        return
-
-    target_user_id = report['user_id']
-    target_username = report['username'] or str(target_user_id)
-
-    # اضافه به لیست سیاه
-    db_exec(
-        "INSERT OR REPLACE INTO blacklist (user_id, reason, created_at) VALUES (?, ?, ?)",
-        (target_user_id, f"بلاک شده توسط مالک (گزارش #{report_id})", now_tehran())
-    )
-    log_action(uid, "user_blocked", f"user={target_user_id}, report={report_id}")
-
-    # ارسال پیام به کاربر بلاک شده (اگر خطا داد نادیده بگیریم چون ممکن است ربات نتواند به کاربر بلاک شده پیام دهد)
-    try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text="⛔ شما توسط مالک ربات بلاک شده‌اید و دیگر نمی‌توانید پیام ارسال کنید."
-        )
-    except Exception:
-        pass
-
-    await query.edit_message_text(
-        f"✅ کاربر {target_username} با موفقیت بلاک شد.",
-        reply_markup=main_menu_kb(uid)
-    )
-
 # ==================== Owner Direct Reply (ریپلای به پیام) ====================
 
 async def owner_direct_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """مالک می‌تواند روی پیام گزارش ریپلای بزند و پاسخ مستقیم به کاربر ارسال شود"""
-    if not update.message or not update.message.text:
+    if not update.message or not update.effective_user:
         return
 
     uid = update.effective_user.id
     if uid != OWNER_ID:
+        return
+
+    if not await check_access(update, context):
         return
 
     replied = update.message.reply_to_message
@@ -521,6 +411,120 @@ async def owner_direct_reply_handler(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         logger.error(f"Failed to send owner reply: {e}")
         await update.message.reply_text(f"❌ ارسال پاسخ ناموفق بود: {str(e)}")
+
+# ==================== Admin Reply (پاسخ به گزارش از طریق دکمه) ====================
+
+async def admin_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await query.edit_message_text("⛔ دسترسی ندارید.")
+        return ConversationHandler.END
+    if not await check_access(update, context):
+        return ConversationHandler.END
+
+    report_id = int(query.data.split('_')[2])
+    context.user_data['reply_report_id'] = report_id
+    await query.edit_message_text(
+        f"📩 **پاسخ به گزارش #{report_id}**\n\n"
+        "لطفاً پاسخ خود را به صورت متن ارسال کنید:\n"
+        "(برای لغو /cancel بزنید)",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
+        ])
+    )
+    return 10
+
+async def admin_reply_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await update.message.reply_text("⛔ دسترسی ندارید.")
+        return ConversationHandler.END
+    if not await check_access(update, context):
+        return ConversationHandler.END
+
+    reply_text = update.message.text
+    report_id = context.user_data.get('reply_report_id')
+    if not report_id:
+        await update.message.reply_text("❌ خطا: شناسه گزارش یافت نشد.")
+        return ConversationHandler.END
+
+    report = db_one("SELECT user_id FROM reports WHERE id = ?", (report_id,))
+    if not report:
+        await update.message.reply_text("❌ گزارش یافت نشد.")
+        return ConversationHandler.END
+
+    target_user_id = report['user_id']
+
+    db_exec(
+        "UPDATE reports SET reply_text = ?, replied_at = ? WHERE id = ?",
+        (reply_text, now_tehran(), report_id)
+    )
+    log_action(uid, "owner_reply", f"report_id={report_id}, user={target_user_id}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"📩 **پاسخ مالک ربات به گزارش شما**\n\n"
+                 f"{reply_text}\n\n"
+                 f"🕐 {now_tehran()}",
+            parse_mode='Markdown'
+        )
+        await update.message.reply_text(
+            f"✅ پاسخ شما به گزارش #{report_id} با موفقیت ارسال شد.",
+            reply_markup=main_menu_kb(uid)
+        )
+    except Exception as e:
+        logger.error(f"Error sending reply to user: {e}")
+        await update.message.reply_text(
+            f"⚠️ پاسخ در دیتابیس ثبت شد اما ارسال به کاربر با خطا مواجه شد.",
+            reply_markup=main_menu_kb(uid)
+        )
+
+    context.user_data.pop('reply_report_id', None)
+    return ConversationHandler.END
+
+# ==================== Admin Block (بلاک کاربر) ====================
+
+async def admin_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await query.edit_message_text("⛔ دسترسی ندارید.")
+        return
+    if not await check_access(update, context):
+        return
+
+    report_id = int(query.data.split('_')[2])
+    report = db_one("SELECT user_id, username FROM reports WHERE id = ?", (report_id,))
+    if not report:
+        await query.edit_message_text("❌ گزارش یافت نشد.")
+        return
+
+    target_user_id = report['user_id']
+    target_username = report['username'] or str(target_user_id)
+
+    db_exec(
+        "INSERT OR REPLACE INTO blacklist (user_id, reason, created_at) VALUES (?, ?, ?)",
+        (target_user_id, f"بلاک شده توسط مالک (گزارش #{report_id})", now_tehran())
+    )
+    log_action(uid, "user_blocked", f"user={target_user_id}, report={report_id}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text="⛔ شما توسط مالک ربات بلاک شده‌اید و دیگر نمی‌توانید پیام ارسال کنید."
+        )
+    except Exception:
+        pass
+
+    await query.edit_message_text(
+        f"✅ کاربر {target_username} با موفقیت بلاک شد.",
+        reply_markup=main_menu_kb(uid)
+    )
 
 # ==================== Admin Panel ====================
 
@@ -629,7 +633,6 @@ async def admin_backup_export(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Export backup error: {e}")
         await query.edit_message_text(f"❌ خطا: {str(e)}", reply_markup=backup_kb())
 
-# Admin backup import conversation
 async def admin_backup_import_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -650,7 +653,7 @@ async def admin_backup_import_start(update: Update, context: ContextTypes.DEFAUL
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ])
     )
-    return 20  # S_ADMIN_BACKUP_IMPORT_FILE
+    return 20
 
 async def admin_backup_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
@@ -676,7 +679,7 @@ async def admin_backup_import_file(update: Update, context: ContextTypes.DEFAULT
             "⚠️ تأیید نهایی: آیا مطمئن هستید؟",
             reply_markup=confirm_kb("admin_backup_import_confirm", "cancel_action")
         )
-        return 21  # S_ADMIN_BACKUP_CONFIRM
+        return 21
     except Exception as e:
         await update.message.reply_text(f"❌ خطا: {str(e)}", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
@@ -722,10 +725,9 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await query.edit_message_text("🛠 پنل مدیریت", reply_markup=admin_kb(), parse_mode='Markdown')
 
-# ==================== Callback Handler ====================
+# ==================== Callback Handlers ====================
 
 async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """مدیریت کالبک‌های مدیریتی (با پیشوند admin_)"""
     query = update.callback_query
     data = query.data
 
@@ -748,7 +750,6 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("دکمه نامعتبر", show_alert=True)
 
 async def handle_global_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """لغو عملیات از هر جایی"""
     query = update.callback_query
     await query.answer()
     uid = update.effective_user.id
@@ -801,14 +802,24 @@ def main() -> None:
     # Handler سراسری برای لغو
     app.add_handler(CallbackQueryHandler(handle_global_cancel, pattern="^cancel_action$"))
 
-    # Handler برای کالبک‌های مدیریتی
+    # Handler برای کالبک‌های مدیریتی (با پیشوند admin_)
     app.add_handler(CallbackQueryHandler(handle_admin_callback, pattern="^admin_"))
 
-    # Handler برای ریپلای مستقیم مالک (قبل از handler عمومی)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, owner_direct_reply_handler))
+    # Handler برای ریپلای مستقیم مالک (فقط برای چت OWNER_ID)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Chat(chat_id=OWNER_ID),
+            owner_direct_reply_handler
+        )
+    )
 
-    # Handler برای پیام‌های کاربران (بعد از همه)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message))
+    # Handler برای پیام‌های کاربران عادی (همه چت‌ها به جز OWNER_ID)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.Chat(chat_id=OWNER_ID),
+            handle_user_message
+        )
+    )
 
     logger.info("ربات گزارش‌های شهروندان کملوت با موفقیت راه‌اندازی شد.")
     app.run_polling(drop_pending_updates=True)
