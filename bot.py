@@ -1,828 +1,317 @@
-# -*- coding: utf-8 -*-
-"""ربات گزارش‌های شهروندان کملوت - با پنل مدیریت، پاسخ و بلاک"""
-
-from __future__ import annotations
-
-import logging
-import os
-import re
+import asyncio
 import json
-import sqlite3
-import threading
-import io
 from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Any
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ContentType
+from aiogram.filters import Command
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    BufferedInputFile
 )
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    ConversationHandler,
+from aiogram.fsm.context import FSMContext
+
+from config import BOT_TOKEN, OWNER_ID
+from database import (
+    init_db, upsert_user, add_log, add_report, is_bot_enabled,
+    set_bot_enabled, is_user_blocked, block_user, unblock_user,
+    get_recent_logs, export_backup, restore_backup, get_user
 )
+from states import AdminReplyState, RestoreState
 
-# -----------------------------
-# Configuration
-# -----------------------------
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "توکن_ربات_را_اینجا_بگذارید_یا_در_متغیرهای_محیطی")
-OWNER_ID = 1275490079
-TEHRAN = ZoneInfo("Asia/Tehran")
-DB_PATH = "report_bot.db"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("camelot-report-bot")
-
-# -----------------------------
-# Constants
-# -----------------------------
-
-BTN_ADMIN = "🛠 پنل مدیریت"
-
-# -----------------------------
-# SQLite helpers
-# -----------------------------
-
-_db_lock = threading.RLock()
-_db = sqlite3.connect(DB_PATH, check_same_thread=False)
-_db.row_factory = sqlite3.Row
-
-def db_exec(query: str, params: tuple = ()) -> None:
-    with _db_lock:
-        cur = _db.execute(query, params)
-        _db.commit()
-        return cur
-
-def db_one(query: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-    with _db_lock:
-        cur = _db.execute(query, params)
-        return cur.fetchone()
-
-def db_all(query: str, params: tuple = ()) -> List[sqlite3.Row]:
-    with _db_lock:
-        cur = _db.execute(query, params)
-        return cur.fetchall()
-
-def init_db() -> None:
-    with _db_lock:
-        _db.execute("PRAGMA journal_mode=WAL;")
-        _db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                full_name TEXT,
-                message TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                replied_at TEXT,
-                reply_text TEXT
-            )
-            """
-        )
-        _db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS blacklist (
-                user_id INTEGER PRIMARY KEY,
-                reason TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        _db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                action TEXT NOT NULL,
-                details TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        _db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        _db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('bot_status', 'on')")
-        _db.commit()
-
-init_db()
-
-# -----------------------------
-# Utility helpers
-# -----------------------------
-
-def now_tehran() -> str:
-    return datetime.now(TEHRAN).strftime("%Y-%m-%d %H:%M:%S")
-
-def bot_is_on() -> bool:
-    row = db_one("SELECT value FROM settings WHERE key = 'bot_status'")
-    return row["value"] == "on" if row else True
-
-def set_bot_status(status: str) -> None:
-    db_exec("INSERT INTO settings(key, value) VALUES('bot_status', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (status,))
-
-def log_action(user_id: Optional[int], action: str, details: str = "") -> None:
-    action_map = {
-        "report_received": "دریافت گزارش",
-        "owner_reply": "پاسخ مالک",
-        "user_blocked": "بلاک کاربر",
-        "user_unblocked": "آنبلاک کاربر",
-        "toggle_bot": "تغییر وضعیت ربات",
-        "backup_export": "گرفتن پشتیبان",
-        "backup_import": "بازیابی از پشتیبان",
-    }
-    persian_action = action_map.get(action, action)
-    db_exec(
-        "INSERT INTO logs(user_id, action, details, created_at) VALUES(?, ?, ?, ?)",
-        (user_id, persian_action, details, now_tehran()),
-    )
-
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_ID
-
-def is_blacklisted(uid: int) -> bool:
-    return db_one("SELECT 1 FROM blacklist WHERE user_id = ?", (uid,)) is not None
-
-# ==================== Backup & Restore Functions ====================
-
-def export_full_backup() -> str:
-    tables = ['reports', 'blacklist', 'logs', 'settings']
-    data = {}
-    with _db_lock:
-        for table in tables:
-            cursor = _db.execute(f"SELECT * FROM {table}")
-            rows = cursor.fetchall()
-            data[table] = [dict(row) for row in rows]
-    return json.dumps(data, indent=2, ensure_ascii=False)
-
-def import_full_backup(json_data: str) -> tuple:
-    try:
-        data = json.loads(json_data)
-    except json.JSONDecodeError as e:
-        return False, f"فایل JSON معتبر نیست: {e}"
-    expected = {'reports', 'blacklist', 'logs', 'settings'}
-    if not expected.issubset(data.keys()):
-        return False, "فایل پشتیبان کامل نیست."
-    with _db_lock:
-        try:
-            for table in expected:
-                _db.execute(f"DELETE FROM {table}")
-            for table, rows in data.items():
-                if not rows:
-                    continue
-                columns = list(rows[0].keys())
-                placeholders = ','.join(['?' for _ in columns])
-                col_names = ','.join(columns)
-                for row in rows:
-                    values = [row.get(col) for col in columns]
-                    _db.execute(f"INSERT INTO {table} ({col_names}) VALUES ({placeholders})", values)
-            _db.commit()
-            return True, "بازیابی با موفقیت انجام شد."
-        except Exception as e:
-            _db.rollback()
-            return False, f"خطا: {str(e)}"
-
-# ==================== Access control ====================
-
-async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    uid = update.effective_user.id if update.effective_user else None
-    if uid is None:
-        return False
-    if is_blacklisted(uid) and not is_owner(uid):
-        msg = "⛔ شما توسط مالک ربات بلاک شده‌اید و نمی‌توانید پیام ارسال کنید."
-        if update.message:
-            await update.message.reply_text(msg)
-        elif update.callback_query:
-            await update.callback_query.answer(msg, show_alert=True)
-        return False
-    if not bot_is_on() and not is_owner(uid):
-        msg = "⛔ ربات در حال حاضر خاموش است."
-        if update.message:
-            await update.message.reply_text(msg)
-        elif update.callback_query:
-            await update.callback_query.answer(msg, show_alert=True)
-        return False
-    return True
-
-# ==================== Keyboards ====================
-
-def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
-    rows = []
-    if is_owner(uid):
-        rows.append([BTN_ADMIN])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-def admin_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔌 خاموش/روشن", callback_data="admin_toggle_bot")],
-        [InlineKeyboardButton("📋 لاگ‌ها", callback_data="admin_logs")],
-        [InlineKeyboardButton("💾 پشتیبان‌گیری و بازیابی", callback_data="admin_backup")],
-        [InlineKeyboardButton("❌ بستن پنل", callback_data="cancel_action")],
+def admin_panel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🟢 روشن کردن ربات", callback_data="bot_on"),
+            InlineKeyboardButton(text="🔴 خاموش کردن ربات", callback_data="bot_off"),
+        ],
+        [
+            InlineKeyboardButton(text="📜 مشاهده لاگ‌ها", callback_data="view_logs"),
+        ],
+        [
+            InlineKeyboardButton(text="📦 پشتیبان گیری", callback_data="backup_data"),
+            InlineKeyboardButton(text="♻️ بازیابی", callback_data="restore_data"),
+        ]
     ])
 
-def backup_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 گرفتن پشتیبان", callback_data="admin_backup_export")],
-        [InlineKeyboardButton("📤 بازیابی از پشتیبان", callback_data="admin_backup_import")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back")],
-    ])
+def report_action_keyboard(user_id: int, blocked: bool = False):
+    buttons = [
+        [InlineKeyboardButton(text="✉️ پاسخ", callback_data=f"reply:{user_id}")]
+    ]
+    if blocked:
+        buttons.append([InlineKeyboardButton(text="✅ آنبلاک کاربر", callback_data=f"unblock:{user_id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="⛔ بلاک کاربر", callback_data=f"block:{user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def confirm_kb(yes_data: str, no_data: str = "cancel_action") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ بله", callback_data=yes_data),
-        InlineKeyboardButton("❌ نه", callback_data=no_data),
-    ]])
-
-def report_notification_kb(report_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩 پاسخ به گزارش", callback_data=f"admin_reply_{report_id}")],
-        [InlineKeyboardButton("🚫 بلاک کاربر", callback_data=f"admin_block_{report_id}")],
-    ])
-
-# ==================== Start & Cancel ====================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await check_access(update, context):
-        return
-    uid = update.effective_user.id
-    welcome = (
-        "🏛 **درود ای شهروند کملوت.**\n\n"
-        "چه کمکی از دستم برمی‌آید؟ آیا گزارشی داری؟\n\n"
-        "لطفاً پیام خود را برای من ارسال کن تا به اطلاع مالک برسانم."
-    )
-    await update.message.reply_text(
-        welcome,
-        reply_markup=main_menu_kb(uid),
-        parse_mode='Markdown'
+def format_user_info(message: Message):
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "ندارد"
+    full_name = user.full_name
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"📨 گزارش جدید\n\n"
+        f"🆔 آیدی عددی: {user.id}\n"
+        f"👤 یوزرنیم: {username}\n"
+        f"📛 نام: {full_name}\n"
+        f"🕒 تاریخ: {date_str}\n\n"
     )
 
-# ==================== Message Handlers ====================
+async def send_to_owner_with_meta(message: Message):
+    header = format_user_info(message)
+    blocked = is_user_blocked(message.from_user.id)
 
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """دریافت پیام کاربر و ارسال به مالک - فقط برای غیر مالک"""
-    if not update.message or not update.effective_user:
-        return
-    
-    uid = update.effective_user.id
-    
-    # اگر مالک است، این هندلر کار نمی‌کند (به جز دکمه پنل مدیریت)
-    if is_owner(uid):
-        # اگر دکمه پنل مدیریت بود، آن را مدیریت کن
-        text = update.message.text or ""
-        if text == BTN_ADMIN:
-            if not await check_access(update, context):
-                return
-            await update.message.reply_text("🛠 **پنل مدیریت**", reply_markup=admin_kb(), parse_mode='Markdown')
-            return
-        return  # مالک پیام عادی ارسال کرده، کاری نکن
-    
-    if not await check_access(update, context):
-        return
-
-    user = update.effective_user
-    message_text = update.message.text or update.message.caption or ""
-
-    # ذخیره گزارش در دیتابیس
-    username = user.username or "بدون یوزرنیم"
-    full_name = user.full_name or "بدون نام"
-    created_at = now_tehran()
-
-    cursor = db_exec(
-        """
-        INSERT INTO reports (user_id, username, full_name, message, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (uid, username, full_name, message_text, created_at)
-    )
-    report_id = cursor.lastrowid
-    log_action(uid, "report_received", f"report_id={report_id}")
-
-    # پاسخ به کاربر
-    await update.message.reply_text(
-        "✅ حرف ها و پیام هایت شنیده شد. مرسی از همراهیت.",
-        reply_markup=main_menu_kb(uid)
-    )
-
-    # ارسال به مالک
-    await notify_owner(update, context, report_id, uid, username, full_name, message_text, created_at)
-
-async def notify_owner(update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: int, uid: int, username: str, full_name: str, message_text: str, created_at: str):
-    """ارسال گزارش به مالک"""
-    msg = (
-        f"📌 *گزارش جدید*\n\n"
-        f"🔖 شماره گزارش: `{report_id}`\n"
-        f"🕒 تاریخ: `{created_at}`\n\n"
-        f"👤 *اطلاعات فرستنده*\n"
-        f"• آیدی عددی: `{uid}`\n"
-        f"• یوزرنیم: @{username if username != 'بدون یوزرنیم' else 'ندارد'}\n"
-        f"• نام اکانت: {full_name}\n\n"
-        f"📝 *متن گزارش:*\n"
-        f"{message_text}"
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=msg,
-            parse_mode='Markdown',
-            reply_markup=report_notification_kb(report_id)
+    if message.content_type == ContentType.TEXT:
+        text = header + f"💬 پیام کاربر:\n{message.text}"
+        await bot.send_message(
+            OWNER_ID,
+            text,
+            reply_markup=report_action_keyboard(message.from_user.id, blocked)
         )
-    except Exception as e:
-        logger.error(f"Failed to notify owner: {e}")
+        add_report(message.from_user.id, "text", content=message.text)
 
-# ==================== Owner Direct Reply (ریپلای به پیام) ====================
-
-async def owner_direct_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مالک می‌تواند روی پیام گزارش ریپلای بزند و پاسخ مستقیم به کاربر ارسال شود"""
-    if not update.message or not update.effective_user:
-        return
-
-    uid = update.effective_user.id
-    if uid != OWNER_ID:
-        return
-
-    if not await check_access(update, context):
-        return
-
-    replied = update.message.reply_to_message
-    if not replied:
-        return
-
-    replied_text = replied.text or replied.caption or ""
-    if "شماره گزارش:" not in replied_text:
-        return
-
-    match = re.search(r"شماره گزارش:\s*`?(\d+)`?", replied_text)
-    if not match:
-        match = re.search(r"شماره گزارش:\s*(\d+)", replied_text)
-    if not match:
-        await update.message.reply_text("❌ شماره گزارش در پیام پیدا نشد.")
-        return
-
-    report_id = int(match.group(1))
-    answer_text = update.message.text.strip()
-
-    report = db_one("SELECT user_id FROM reports WHERE id = ?", (report_id,))
-    if not report:
-        await update.message.reply_text("❌ گزارش پیدا نشد.")
-        return
-
-    target_user_id = report['user_id']
-
-    try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"📩 **پاسخ مالک ربات به گزارش شما**\n\n"
-                 f"{answer_text}\n\n"
-                 f"🕐 {now_tehran()}",
-            parse_mode='Markdown'
+    elif message.content_type == ContentType.PHOTO:
+        caption = message.caption or ""
+        text = header + f"🖼 عکس کاربر\n\n📝 کپشن:\n{caption if caption else 'ندارد'}"
+        await bot.send_photo(
+            OWNER_ID,
+            photo=message.photo[-1].file_id,
+            caption=text,
+            reply_markup=report_action_keyboard(message.from_user.id, blocked)
         )
+        add_report(message.from_user.id, "photo", content=caption, file_id=message.photo[-1].file_id)
 
-        db_exec(
-            "UPDATE reports SET reply_text = ?, replied_at = ? WHERE id = ?",
-            (answer_text, now_tehran(), report_id)
+    elif message.content_type == ContentType.VIDEO:
+        caption = message.caption or ""
+        text = header + f"🎬 ویدیو کاربر\n\n📝 کپشن:\n{caption if caption else 'ندارد'}"
+        await bot.send_video(
+            OWNER_ID,
+            video=message.video.file_id,
+            caption=text,
+            reply_markup=report_action_keyboard(message.from_user.id, blocked)
         )
-        log_action(uid, "owner_reply", f"report_id={report_id}, user={target_user_id}")
+        add_report(message.from_user.id, "video", content=caption, file_id=message.video.file_id)
 
-        await update.message.reply_text(
-            f"✅ پاسخ شما برای کاربر (گزارش #{report_id}) ارسال شد.",
-            reply_markup=main_menu_kb(uid)
+    elif message.content_type == ContentType.VOICE:
+        text = header + "🎤 ویس کاربر"
+        await bot.send_voice(
+            OWNER_ID,
+            voice=message.voice.file_id,
+            caption=text,
+            reply_markup=report_action_keyboard(message.from_user.id, blocked)
         )
-    except Exception as e:
-        logger.error(f"Failed to send owner reply: {e}")
-        await update.message.reply_text(f"❌ ارسال پاسخ ناموفق بود: {str(e)}")
+        add_report(message.from_user.id, "voice", file_id=message.voice.file_id)
 
-# ==================== Admin Reply (پاسخ به گزارش از طریق دکمه) ====================
+    elif message.content_type == ContentType.DOCUMENT:
+        caption = message.caption or ""
+        text = header + f"📄 فایل کاربر\n\n📝 کپشن:\n{caption if caption else 'ندارد'}"
+        await bot.send_document(
+            OWNER_ID,
+            document=message.document.file_id,
+            caption=text,
+            reply_markup=report_action_keyboard(message.from_user.id, blocked)
+        )
+        add_report(message.from_user.id, "document", content=caption, file_id=message.document.file_id)
 
-async def admin_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return ConversationHandler.END
-    if not await check_access(update, context):
-        return ConversationHandler.END
+    else:
+        text = header + f"⚠️ یک پیام از نوع {message.content_type} ارسال شد که پشتیبانی محدود دارد."
+        await bot.send_message(
+            OWNER_ID,
+            text,
+            reply_markup=report_action_keyboard(message.from_user.id, blocked)
+        )
+        add_report(message.from_user.id, message.content_type, content="unsupported preview")
 
-    report_id = int(query.data.split('_')[2])
-    context.user_data['reply_report_id'] = report_id
-    await query.edit_message_text(
-        f"📩 **پاسخ به گزارش #{report_id}**\n\n"
-        "لطفاً پاسخ خود را به صورت متن ارسال کنید:\n"
-        "(برای لغو /cancel بزنید)",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
-        ])
+@dp.message(Command("start"))
+async def start_handler(message: Message):
+    upsert_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.full_name
     )
-    return 10
+    add_log("start", message.from_user.id, "User started bot")
 
-async def admin_reply_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return ConversationHandler.END
-    if not await check_access(update, context):
-        return ConversationHandler.END
-
-    reply_text = update.message.text
-    report_id = context.user_data.get('reply_report_id')
-    if not report_id:
-        await update.message.reply_text("❌ خطا: شناسه گزارش یافت نشد.")
-        return ConversationHandler.END
-
-    report = db_one("SELECT user_id FROM reports WHERE id = ?", (report_id,))
-    if not report:
-        await update.message.reply_text("❌ گزارش یافت نشد.")
-        return ConversationHandler.END
-
-    target_user_id = report['user_id']
-
-    db_exec(
-        "UPDATE reports SET reply_text = ?, replied_at = ? WHERE id = ?",
-        (reply_text, now_tehran(), report_id)
-    )
-    log_action(uid, "owner_reply", f"report_id={report_id}, user={target_user_id}")
-
-    try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"📩 **پاسخ مالک ربات به گزارش شما**\n\n"
-                 f"{reply_text}\n\n"
-                 f"🕐 {now_tehran()}",
-            parse_mode='Markdown'
-        )
-        await update.message.reply_text(
-            f"✅ پاسخ شما به گزارش #{report_id} با موفقیت ارسال شد.",
-            reply_markup=main_menu_kb(uid)
-        )
-    except Exception as e:
-        logger.error(f"Error sending reply to user: {e}")
-        await update.message.reply_text(
-            f"⚠️ پاسخ در دیتابیس ثبت شد اما ارسال به کاربر با خطا مواجه شد.",
-            reply_markup=main_menu_kb(uid)
-        )
-
-    context.user_data.pop('reply_report_id', None)
-    return ConversationHandler.END
-
-# ==================== Admin Block (بلاک کاربر) ====================
-
-async def admin_block_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
+    if not is_bot_enabled() and message.from_user.id != OWNER_ID:
+        await message.answer("ربات خاموشه.")
         return
 
-    report_id = int(query.data.split('_')[2])
-    report = db_one("SELECT user_id, username FROM reports WHERE id = ?", (report_id,))
-    if not report:
-        await query.edit_message_text("❌ گزارش یافت نشد.")
-        return
-
-    target_user_id = report['user_id']
-    target_username = report['username'] or str(target_user_id)
-
-    db_exec(
-        "INSERT OR REPLACE INTO blacklist (user_id, reason, created_at) VALUES (?, ?, ?)",
-        (target_user_id, f"بلاک شده توسط مالک (گزارش #{report_id})", now_tehran())
-    )
-    log_action(uid, "user_blocked", f"user={target_user_id}, report={report_id}")
-
-    try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text="⛔ شما توسط مالک ربات بلاک شده‌اید و دیگر نمی‌توانید پیام ارسال کنید."
-        )
-    except Exception:
-        pass
-
-    await query.edit_message_text(
-        f"✅ کاربر {target_username} با موفقیت بلاک شد.",
-        reply_markup=main_menu_kb(uid)
-    )
-
-# ==================== Admin Panel ====================
-
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
-        return
-
-    await query.edit_message_text("🛠 **پنل مدیریت**", reply_markup=admin_kb(), parse_mode='Markdown')
-
-async def admin_toggle_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
-        return
-
-    new_status = "off" if bot_is_on() else "on"
-    set_bot_status(new_status)
-    log_action(uid, "toggle_bot", f"وضعیت: {'خاموش' if new_status == 'off' else 'روشن'}")
-    status_text = "🟢 روشن" if new_status == "on" else "🔴 خاموش"
-    await query.edit_message_text(
-        f"✅ وضعیت ربات: {status_text}",
-        reply_markup=admin_kb()
-    )
-
-async def admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
-        return
-
-    rows = db_all("SELECT * FROM logs ORDER BY id DESC LIMIT 50")
-    if not rows:
-        await query.edit_message_text("📭 هیچ لاگی وجود ندارد.", reply_markup=admin_kb())
-        return
-
-    text = "📋 **لاگ‌های اخیر**\n━━━━━━━━━━━━━━━━━━━\n"
-    for row in rows:
-        user_info = f"کاربر: {row['user_id']}" if row['user_id'] else "سیستم"
-        text += f"🕐 {row['created_at']}\n"
-        text += f"👤 {user_info}\n"
-        text += f"📌 {row['action']}\n"
-        if row['details']:
-            text += f"📝 {row['details']}\n"
-        text += "━━━━━━━━━━━━━━━━━━━\n"
-    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=admin_kb())
-
-async def admin_backup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
-        return
-
-    await query.edit_message_text(
-        "💾 **پشتیبان‌گیری و بازیابی**",
-        reply_markup=backup_kb(),
-        parse_mode='Markdown'
-    )
-
-async def admin_backup_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
-        return
-
-    await query.edit_message_text("📥 در حال تهیه پشتیبان... لطفاً صبر کنید.", parse_mode='Markdown')
-    try:
-        json_data = export_full_backup()
-        file_obj = io.BytesIO(json_data.encode('utf-8'))
-        file_obj.name = f"report_bot_backup_{datetime.now(TEHRAN).strftime('%Y%m%d_%H%M%S')}.json"
-        await context.bot.send_document(
-            chat_id=uid,
-            document=file_obj,
-            caption="💾 **پشتیبان ربات گزارش‌ها**\n\n"
-                    f"🕐 تاریخ: {now_tehran()}\n"
-                    "برای بازیابی، از بخش «بازیابی از پشتیبان» استفاده کنید.",
-            parse_mode='Markdown'
-        )
-        log_action(uid, "backup_export", f"تعداد رکوردها: {len(json.loads(json_data).get('reports', []))}")
-        await query.edit_message_text(
-            "✅ پشتیبان با موفقیت تهیه و ارسال شد.",
-            reply_markup=backup_kb()
-        )
-    except Exception as e:
-        logger.error(f"Export backup error: {e}")
-        await query.edit_message_text(f"❌ خطا: {str(e)}", reply_markup=backup_kb())
-
-async def admin_backup_import_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return ConversationHandler.END
-    if not await check_access(update, context):
-        return ConversationHandler.END
-
-    await query.edit_message_text(
-        "📤 **بازیابی از پشتیبان**\n\n"
-        "⚠️ این عملیات تمام اطلاعات فعلی را بازنویسی می‌کند.\n"
-        "لطفاً فایل JSON پشتیبان را ارسال کنید.\n"
-        "(برای لغو /cancel بزنید)",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
-        ])
-    )
-    return 20
-
-async def admin_backup_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return ConversationHandler.END
-    if not await check_access(update, context):
-        return ConversationHandler.END
-
-    document = update.message.document
-    if not document or not document.file_name.endswith('.json'):
-        await update.message.reply_text("❌ لطفاً یک فایل JSON معتبر ارسال کنید.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
-        ]))
-        return 20
-
-    try:
-        file = await context.bot.get_file(document.file_id)
-        content = await file.download_as_bytearray()
-        json_data = content.decode('utf-8')
-        context.user_data['backup_json_data'] = json_data
-        await update.message.reply_text(
-            "⚠️ تأیید نهایی: آیا مطمئن هستید؟",
-            reply_markup=confirm_kb("admin_backup_import_confirm", "cancel_action")
-        )
-        return 21
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا: {str(e)}", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
-        ]))
-        return ConversationHandler.END
-
-async def admin_backup_import_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
-        return
-    if not await check_access(update, context):
-        return
-
-    json_data = context.user_data.get('backup_json_data')
-    if not json_data:
-        await query.edit_message_text("❌ داده‌های پشتیبان یافت نشد.")
-        return
-
-    await query.edit_message_text("🔄 در حال بازیابی... لطفاً صبر کنید.", parse_mode='Markdown')
-    success, msg = import_full_backup(json_data)
-    if success:
-        log_action(uid, "backup_import", "بازیابی موفقیت‌آمیز")
-        await query.edit_message_text(
-            "✅ بازیابی با موفقیت انجام شد.\nلطفاً ربات را ری‌استارت کنید.",
-            reply_markup=admin_kb()
+    if message.from_user.id == OWNER_ID:
+        await message.answer(
+            "سلام مالک. پنل مدیریت:",
+            reply_markup=admin_panel_keyboard()
         )
     else:
-        await query.edit_message_text(f"❌ خطا: {msg}", reply_markup=admin_kb())
-    context.user_data.pop('backup_json_data', None)
+        await message.answer("درود ای شهروند کملوت، چه کمکی از دستم برمی آید؟ آیا گزارشی داری؟")
 
-async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await query.edit_message_text("⛔ دسترسی ندارید.")
+@dp.message(Command("panel"))
+async def panel_handler(message: Message):
+    if message.from_user.id != OWNER_ID:
         return
-    if not await check_access(update, context):
+    add_log("open_panel", message.from_user.id, "Owner opened panel")
+    await message.answer("پنل مدیریت:", reply_markup=admin_panel_keyboard())
+
+@dp.callback_query(F.data == "bot_on")
+async def bot_on_handler(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
         return
+    set_bot_enabled(True)
+    add_log("bot_on", callback.from_user.id, "Bot turned on")
+    await callback.message.edit_text("✅ ربات روشن شد.", reply_markup=admin_panel_keyboard())
+    await callback.answer()
 
-    await query.edit_message_text("🛠 پنل مدیریت", reply_markup=admin_kb(), parse_mode='Markdown')
-
-# ==================== Callback Handlers ====================
-
-async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    data = query.data
-
-    if not await check_access(update, context):
+@dp.callback_query(F.data == "bot_off")
+async def bot_off_handler(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
         return
+    set_bot_enabled(False)
+    add_log("bot_off", callback.from_user.id, "Bot turned off")
+    await callback.message.edit_text("🔴 ربات خاموش شد.", reply_markup=admin_panel_keyboard())
+    await callback.answer()
 
-    if data == "admin_panel":
-        await admin_panel(update, context)
-    elif data == "admin_toggle_bot":
-        await admin_toggle_bot(update, context)
-    elif data == "admin_logs":
-        await admin_logs(update, context)
-    elif data == "admin_backup":
-        await admin_backup_menu(update, context)
-    elif data == "admin_backup_export":
-        await admin_backup_export(update, context)
-    elif data == "admin_back":
-        await admin_back(update, context)
+@dp.callback_query(F.data == "view_logs")
+async def logs_handler(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        return
+    logs = get_recent_logs(20)
+    if not logs:
+        text = "هیچ لاگی ثبت نشده."
     else:
-        await query.answer("دکمه نامعتبر", show_alert=True)
+        parts = []
+        for log in logs:
+            parts.append(
+                f"#{log['id']} | {log['action']}\n"
+                f"کاربر: {log['user_id']}\n"
+                f"جزئیات: {log['details']}\n"
+                f"تاریخ: {log['created_at']}"
+            )
+        text = "📜 20 لاگ آخر:\n\n" + "\n\n".join(parts)
 
-async def handle_global_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    await query.edit_message_text(
-        "❌ عملیات لغو شد.",
-        reply_markup=main_menu_kb(uid)
+    add_log("view_logs", callback.from_user.id, "Viewed recent logs")
+    await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "backup_data")
+async def backup_handler(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        return
+
+    data = export_backup()
+    json_data = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    file = BufferedInputFile(json_data, filename="backup.json")
+
+    add_log("backup", callback.from_user.id, "Database backup exported")
+    await callback.message.answer_document(file, caption="✅ فایل پشتیبان دیتابیس")
+    await callback.answer()
+
+@dp.callback_query(F.data == "restore_data")
+async def restore_request_handler(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        return
+    await state.set_state(RestoreState.waiting_for_backup_file)
+    add_log("restore_request", callback.from_user.id, "Owner requested restore")
+    await callback.message.answer("فایل JSON بکاپ را ارسال کن.")
+    await callback.answer()
+
+@dp.message(RestoreState.waiting_for_backup_file, F.document)
+async def restore_handler(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    try:
+        file = await bot.get_file(message.document.file_id)
+        file_data = await bot.download_file(file.file_path)
+        content = file_data.read().decode("utf-8")
+        data = json.loads(content)
+
+        restore_backup(data)
+        add_log("restore", message.from_user.id, "Database restored from backup")
+        await message.answer("✅ بازیابی با موفقیت انجام شد.")
+    except Exception as e:
+        add_log("restore_failed", message.from_user.id, str(e))
+        await message.answer(f"❌ خطا در بازیابی:\n{e}")
+
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("reply:"))
+async def reply_callback_handler(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        return
+    user_id = int(callback.data.split(":")[1])
+    await state.set_state(AdminReplyState.waiting_for_reply)
+    await state.update_data(target_user_id=user_id)
+    add_log("reply_mode", callback.from_user.id, f"Reply mode for user {user_id}")
+    await callback.message.answer(f"متن پاسخ به کاربر {user_id} را ارسال کن.")
+    await callback.answer()
+
+@dp.message(AdminReplyState.waiting_for_reply)
+async def send_admin_reply(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    data = await state.get_data()
+    user_id = data.get("target_user_id")
+
+    try:
+        await bot.send_message(user_id, f"📩 پاسخ پشتیبانی:\n\n{message.text}")
+        add_log("admin_reply", message.from_user.id, f"Reply sent to user {user_id}: {message.text}")
+        await message.answer("✅ پاسخ ارسال شد.")
+    except Exception as e:
+        add_log("admin_reply_failed", message.from_user.id, str(e))
+        await message.answer(f"❌ ارسال پاسخ ناموفق بود:\n{e}")
+
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("block:"))
+async def block_handler(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        return
+    user_id = int(callback.data.split(":")[1])
+    block_user(user_id)
+    add_log("block_user", callback.from_user.id, f"Blocked user {user_id}")
+    await callback.message.answer(f"⛔ کاربر {user_id} بلاک شد.")
+    await callback.answer("کاربر بلاک شد.")
+
+@dp.callback_query(F.data.startswith("unblock:"))
+async def unblock_handler(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        return
+    user_id = int(callback.data.split(":")[1])
+    unblock_user(user_id)
+    add_log("unblock_user", callback.from_user.id, f"Unblocked user {user_id}")
+    await callback.message.answer(f"✅ کاربر {user_id} آنبلاک شد.")
+    await callback.answer("کاربر آنبلاک شد.")
+
+@dp.message()
+async def all_messages_handler(message: Message):
+    upsert_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.full_name
     )
 
-# ==================== Conversation Handlers ====================
+    if not is_bot_enabled() and message.from_user.id != OWNER_ID:
+        add_log("blocked_by_bot_off", message.from_user.id, "Attempt while bot is off")
+        await message.answer("ربات خاموشه.")
+        return
 
-admin_reply_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(admin_reply_start, pattern="^admin_reply_")],
-    states={
-        10: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reply_text_handler)],
-    },
-    fallbacks=[
-        CommandHandler("cancel", lambda u,c: ConversationHandler.END),
-        CallbackQueryHandler(handle_global_cancel, pattern="^cancel_action$"),
-    ],
-)
+    if message.from_user.id == OWNER_ID:
+        return
 
-admin_backup_import_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(admin_backup_import_start, pattern="^admin_backup_import$")],
-    states={
-        20: [MessageHandler(filters.Document.ALL, admin_backup_import_file)],
-        21: [CallbackQueryHandler(admin_backup_import_confirm, pattern="^admin_backup_import_confirm$")],
-    },
-    fallbacks=[
-        CommandHandler("cancel", lambda u,c: ConversationHandler.END),
-        CallbackQueryHandler(handle_global_cancel, pattern="^cancel_action$"),
-    ],
-)
+    if is_user_blocked(message.from_user.id):
+        add_log("blocked_user_message", message.from_user.id, "Blocked user tried to send message")
+        return
 
-# ===================== Main =====================
+    await send_to_owner_with_meta(message)
+    add_log("user_report", message.from_user.id, f"Sent {message.content_type} report to owner")
+    await message.answer("حرف ها و پیام هایت شنیده شد. مرسی از همراهیت.")
 
-def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", lambda u,c: ConversationHandler.END))
-
-    # Conversation handlers
-    app.add_handler(admin_reply_conv)
-    app.add_handler(admin_backup_import_conv)
-
-    # Handler برای بلاک کردن کاربر
-    app.add_handler(CallbackQueryHandler(admin_block_user, pattern="^admin_block_"))
-
-    # Handler سراسری برای لغو
-    app.add_handler(CallbackQueryHandler(handle_global_cancel, pattern="^cancel_action$"))
-
-    # Handler برای کالبک‌های مدیریتی (با پیشوند admin_)
-    app.add_handler(CallbackQueryHandler(handle_admin_callback, pattern="^admin_"))
-
-    # Handler برای ریپلای مستقیم مالک (فقط برای چت OWNER_ID)
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Chat(chat_id=OWNER_ID),
-            owner_direct_reply_handler
-        )
-    )
-
-    # Handler برای پیام‌های کاربران عادی (همه چت‌ها به جز OWNER_ID)
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & ~filters.Chat(chat_id=OWNER_ID),
-            handle_user_message
-        )
-    )
-
-    logger.info("ربات گزارش‌های شهروندان کملوت با موفقیت راه‌اندازی شد.")
-    app.run_polling(drop_pending_updates=True)
+async def main():
+    init_db()
+    add_log("bot_started", OWNER_ID, "Bot process started")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
