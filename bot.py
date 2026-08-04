@@ -306,7 +306,7 @@ async def all_messages_handler(message: Message):
 
     await send_to_owner_with_meta(message)
     add_log("user_report", message.from_user.id, f"Sent {message.content_type} report to owner")
-    await message.answer("حرف ها و پیام هایت شنیده شد. مرسی از همراهیت.")
+    await message.answer("با تشکر از شما شهروندگرامی.")
 
 async def main():
     init_db()
